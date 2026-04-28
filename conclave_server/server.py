@@ -471,6 +471,180 @@ def get_session(auth_token: str, session_id: str) -> dict:
         }
 
 
+@mcp.tool
+def modify_tree(
+    auth_token: str,
+    session_id: str,
+    add: list[dict] | None = None,
+    modify: list[dict] | None = None,
+    prune: list[dict] | None = None,
+) -> dict:
+    """Apply a re-planning diff to a session's tree. Initiator only.
+
+    add:    [{"prompt", "assignee_role", "depends_on"?}]  — same shape as post_question
+    modify: [{"node_id", "new_prompt"}]                   — only allowed on status='active'
+    prune:  [{"node_id", "reason"}]                       — only allowed on status='active'
+
+    All operations apply atomically. A single `tree_modified` public event is
+    emitted summarizing the diff. Newly-added questions trigger the same
+    notification fan-out as post_question.
+    """
+    add = add or []
+    modify = modify or []
+    prune = prune or []
+    with get_conn() as conn:
+        me = _auth(conn, auth_token)
+        sess = conn.execute(
+            "SELECT created_by FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if not sess:
+            raise ValueError("unknown session")
+        if sess["created_by"] != me["id"]:
+            raise PermissionError("only the session initiator may modify the tree")
+
+        added_nodes: list[dict] = []
+        for a in add:
+            node_id = _short_id()
+            depends_on = a.get("depends_on", [])
+            conn.execute(
+                "INSERT INTO nodes (id, session_id, prompt, assignee_role, depends_on) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    node_id,
+                    session_id,
+                    a["prompt"],
+                    a["assignee_role"],
+                    json.dumps(depends_on),
+                ),
+            )
+            added_nodes.append(
+                {
+                    "node_id": node_id,
+                    "prompt": a["prompt"],
+                    "assignee_role": a["assignee_role"],
+                }
+            )
+
+        modified_nodes: list[dict] = []
+        for m in modify:
+            row = conn.execute(
+                "SELECT status, prompt FROM nodes WHERE id = ? AND session_id = ?",
+                (m["node_id"], session_id),
+            ).fetchone()
+            if not row:
+                raise ValueError(f"unknown node {m['node_id']}")
+            if row["status"] != "active":
+                raise ValueError(
+                    f"cannot modify node {m['node_id']} with status {row['status']}"
+                )
+            conn.execute(
+                "UPDATE nodes SET prompt = ? WHERE id = ?",
+                (m["new_prompt"], m["node_id"]),
+            )
+            modified_nodes.append(
+                {
+                    "node_id": m["node_id"],
+                    "old_prompt": row["prompt"],
+                    "new_prompt": m["new_prompt"],
+                }
+            )
+
+        pruned_nodes: list[dict] = []
+        for p in prune:
+            row = conn.execute(
+                "SELECT status, prompt, assignee_role FROM nodes "
+                "WHERE id = ? AND session_id = ?",
+                (p["node_id"], session_id),
+            ).fetchone()
+            if not row:
+                raise ValueError(f"unknown node {p['node_id']}")
+            if row["status"] != "active":
+                raise ValueError(
+                    f"cannot prune node {p['node_id']} with status {row['status']}"
+                )
+            conn.execute(
+                "UPDATE nodes SET status = 'pruned' WHERE id = ?", (p["node_id"],)
+            )
+            pruned_nodes.append(
+                {
+                    "node_id": p["node_id"],
+                    "prompt": row["prompt"],
+                    "role": row["assignee_role"],
+                    "reason": p.get("reason", ""),
+                }
+            )
+
+        _emit(
+            conn,
+            session_id,
+            "tree_modified",
+            {
+                "added": added_nodes,
+                "modified": modified_nodes,
+                "pruned": pruned_nodes,
+                "by": me["slack_user_id"],
+            },
+        )
+
+        # Notify assignees of newly-added active questions.
+        for n in added_nodes:
+            rows = conn.execute(
+                "SELECT u.slack_user_id FROM members m "
+                "JOIN users u ON u.id = m.user_id "
+                "WHERE m.session_id = ? AND m.role = ?",
+                (session_id, n["assignee_role"]),
+            ).fetchall()
+            for r in rows:
+                send_dm(
+                    r["slack_user_id"],
+                    f"New question in session {session_id} ({n['assignee_role']}):\n"
+                    f"  {n['prompt']}\n"
+                    f"Run /grill inbox to answer.",
+                )
+
+        return {
+            "added": added_nodes,
+            "modified": modified_nodes,
+            "pruned": pruned_nodes,
+        }
+
+
+@mcp.tool
+def close_session(
+    auth_token: str,
+    session_id: str,
+    summary: str = "",
+) -> dict:
+    """Mark a session complete. Initiator only.
+
+    Typically called from `/grill resume` once every node is answered or pruned
+    and the planner has produced a final implementation summary. The `summary`
+    is published to the timeline.
+    """
+    with get_conn() as conn:
+        me = _auth(conn, auth_token)
+        sess = conn.execute(
+            "SELECT created_by, status FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if not sess:
+            raise ValueError("unknown session")
+        if sess["created_by"] != me["id"]:
+            raise PermissionError("only the session initiator may close the session")
+        if sess["status"] == "complete":
+            return {"ok": True, "already_complete": True}
+
+        conn.execute(
+            "UPDATE sessions SET status = 'complete' WHERE id = ?", (session_id,)
+        )
+        _emit(
+            conn,
+            session_id,
+            "session_closed",
+            {"summary": summary, "by": me["slack_user_id"]},
+        )
+        return {"ok": True}
+
+
 def main() -> None:
     init_db()
     mcp.run(transport="http", host="127.0.0.1", port=8765)

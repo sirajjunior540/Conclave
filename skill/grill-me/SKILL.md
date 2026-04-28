@@ -9,7 +9,7 @@ You run an interactive clarification session. Your job is to turn a vague goal i
 
 ## Mode detection
 
-If the `conclave` MCP tools are available (`claim_identity`, `create_session`, `post_question`, `list_my_questions`, `get_question`, `commit_decision`, `get_session`), you are in **Conclave mode**. Otherwise, local mode — just grill and summarize.
+If the `conclave` MCP tools are available (`claim_identity`, `create_session`, `post_question`, `list_my_questions`, `get_question`, `commit_decision`, `get_session`, `modify_tree`, `close_session`), you are in **Conclave mode**. Otherwise, local mode — just grill and summarize.
 
 The user's invocation determines the sub-flow in Conclave mode:
 
@@ -76,13 +76,27 @@ Call `get_session` and render compactly:
 
 ## Sub-flow: `/grill resume <session_id>` (initiator)
 
-1. Call `get_session`.
-2. Identify decisions committed since the user was last here (heuristic: those with `decided_at` after the last time you ran `/grill resume` for this session — if you can't tell, just summarize all answered nodes).
-3. Brief the user: "Since last time, X committed Y, Z committed W."
-4. Ask: do these change anything? Should new questions be posted? Are any pending questions now obsolete?
-   - If new questions: `post_question` for each.
-   - Slice 0 has no `prune` tool; just leave obsolete ones and note them in the summary.
-5. If every node is `answered`, generate a final implementation plan that references the committed decisions (by role + decision text), and ask the user if they're ready to wrap. (No close-session tool in slice 0; just stop.)
+This is where re-planning happens. You are the planner instance for this session — you are the only client allowed to call `modify_tree` or `close_session`.
+
+1. Call `get_session`. You now have: goal, full tree (active / answered / pruned), timeline of public events.
+2. Brief the user on what's new since last resume:
+   - Decisions committed (by role): the decision text + rationale.
+   - Any tree modifications you made yourself last time (timeline `tree_modified` events).
+3. Now think (out loud, with the user) about three questions:
+   - **Did any new commit unlock a question you couldn't ask before?** (Something whose answer was contingent on a now-resolved decision.) → `add` it.
+   - **Did any new commit make a still-active question obsolete?** (E.g., product chose monthly billing, so an active question about per-call billing is moot.) → `prune` it with a one-line `reason`.
+   - **Did any new commit invalidate an *already-answered* node?** (A real conflict.) Don't try to fix this silently — call out the conflict to the user and let them decide whether to add a reconciliation question for the involved roles. (Reopening answered nodes is out of scope for slice 1.)
+   - **Did any new commit change what an existing active question should ask?** (The framing is now stale.) → `modify` its prompt.
+4. Show the user the proposed diff: `add[]`, `modify[]`, `prune[]`. Edit on request. Be conservative — small, targeted changes. Don't re-write the tree just because you can.
+5. On approval, call `modify_tree(auth_token, session_id, add=..., modify=..., prune=...)`. The added nodes get DM-fanned-out automatically.
+6. If every node in the tree is now `answered` or `pruned`:
+   - Draft a final implementation summary that references the committed decisions by role and the rationale for each.
+   - Show it to the user for approval.
+   - On approval, call `close_session(auth_token, session_id, summary=<approved text>)`.
+   - Confirm: "Session closed. Final summary published to the timeline."
+7. If there are still active nodes, end with: "Re-planned: added N, modified M, pruned P. Still waiting on <roles with active questions>. Run `/grill resume <session_id>` again when more commits land."
+
+**Don't sit in a loop.** If nothing new has happened since the last commit you can see, say so and exit. The point of `/grill resume` is to react to changes, not to re-deliberate about the same state.
 
 ## Privacy contract (non-negotiable)
 
