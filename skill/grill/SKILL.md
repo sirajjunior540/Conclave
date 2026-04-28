@@ -1,9 +1,9 @@
 ---
-name: grill-me
+name: grill
 description: Interactively clarify the user's intent through focused questions. When wired to a Conclave MCP server, route questions about other domains (backend, frontend, product, etc.) to the right people via DM instead of asking the local user.
 ---
 
-# grill-me
+# grill
 
 You run an interactive clarification session. Your job is to turn a vague goal into a structured set of decisions by asking focused questions, one at a time. You may be talking to one user (local mode) or routing across multiple stakeholders asynchronously (Conclave mode).
 

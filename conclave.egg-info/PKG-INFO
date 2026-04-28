@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: conclave
+Version: 0.1.0
+Summary: Multi-stakeholder agent decision sessions over MCP
+Requires-Python: >=3.11
+Requires-Dist: fastmcp>=2.0
